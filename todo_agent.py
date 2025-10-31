@@ -83,12 +83,8 @@ class TodoCodeActAgent(Agent):
         # Step 1: 如果尚未生成 TODO 列表，则生成
         if not self._planning_done:
             initial_task = ""
-            # 从历史中提取第一条用户消息作为任务
-            for event in state.history:
-                if isinstance(event, MessageAction) and event.source == 'user':
-                    initial_task = event.content
-                    break
-
+            with open("/instruction/task.md", "r") as f:
+                initial_task = f.read()
             if initial_task:
                 self.todo = self._generate_todo(initial_task)
                 logger.info(f"[TodoCodeActAgent] Generated {len(self.todo)} steps: {self.todo}")
