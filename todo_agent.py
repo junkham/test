@@ -1,80 +1,82 @@
 from __future__ import annotations
-import json, re
-from pathlib import Path
+import re
 from typing import List
+import logging
 
 from openhands.agenthub.codeact_agent.codeact_agent import CodeActAgent
 from openhands.controller.agent import Agent
 from openhands.core.config import LLMConfig
-from openhands.events.action import Action, MessageAction
-from openhands.events.observation import Observation
+from openhands.events.action import MessageAction
 from openhands.llm.llm import LLM
 
-# ---------- 工具：勾掉/更新 TODO ----------
-class UpdateTodoAction(Action):
-    action: str = "update_todo"
-    todo_list: List[str]
-    done_index: int                # 刚完成的序号（0-base）
+logger = logging.getLogger(__name__)
 
-    def run(self, controller):
-        self.todo_list.pop(self.done_index)
-        return MessageAction(content="TODO updated", metadata={"remaining": self.todo_list})
-
-
-# ---------- 新 Agent：规划 + CodeAct ----------
 class TodoCodeActAgent(Agent):
-    """外层规划器，内层仍用原 CodeActAgent 干活"""
+    """分层 agent：先规划 todo，再逐步完成"""
+
     def __init__(self, llm_config: LLMConfig, config=None):
         super().__init__(llm_config, config)
         self.llm = LLM(llm_config)
-        self.codeact = CodeActAgent(self.llm, config)   # 真正干活的
+        self.codeact = CodeActAgent(llm_config, config)
         self.todo: List[str] = []
 
-    # ---- 1. 一次性生成 TODO ----
-    def _make_todo(self, history) -> List[str]:
+    def _generate_todo(self, task: str) -> List[str]:
         prompt = (
-            "You are a planner. Read the task below and output a concise todo list "
-            "（每行一个，简短动词开头，不含编号）:\n\n"
-            f"{history[0].content}\n\n"
-            "TODO:"
+            "You are a planner. Break down the following task into concise, "
+            "ordered steps (one per line, verb-starting, no numbering):\n\n"
+            f"{task}\n\n"
+            "Steps:"
         )
-        resp = self.llm.completion(prompt)
-        return [line.strip("- ") for line in resp.splitlines() if line.strip()]
+        try:
+            resp = self.llm.completion(prompt).text
+            steps = [line.strip('- ') for line in resp.splitlines() if 1 <= len(line.strip()) <= 100]
+            return steps[:10]  # limit
+        except Exception as e:
+            logger.warning(f"LLM planning failed: {e}")
+            return ["Analyze the task", "Plan next steps", "Execute", "Verify"]
 
-    # ---- 2. 每轮把剩余子任务写进 prompt ----
-    def _wrap_prompt(self, history):
+    def step(self, state) -> MessageAction:
+        # Step 1: 初始化 TODO（仅一次）
         if not self.todo:
-            return history
-        todo_txt = "\n".join(f"{i}. {t}" for i, t in enumerate(self.todo, 1))
-        header = MessageAction(
-            content=f"[Planner] 剩余子任务：\n{todo_txt}\n请完成第 1 项，然后返回简短结果。",
-            source="user",
-        )
-        return [header] + history
+            initial_msg = ""
+            for evt in state.history:
+                if isinstance(evt, MessageAction) and evt.source == 'user':
+                    initial_msg = evt.content
+                    break
+            self.todo = self._generate_todo(initial_msg)
+            logger.info(f"[TodoCodeAct] Generated {len(self.todo)} steps: {self.todo}")
 
-    # ---- 3. 主入口 ----
-    def step(self, state) -> Action:
-        # 首次调用：生成 TODO
-        if not self.todo:
-            self.todo = self._make_todo(state.history)
-            logger.info("[TodoCodeAct] 生成 %d 项子任务", len(self.todo))
+        # Step 2: 构造带进度提示的系统 message
+        if self.todo:
+            current_step = self.todo[0]
+            prefix_msg = (
+                f"[Planner] Current task: {current_step}\n"
+                f"Remaining: {len(self.todo) - 1}\n"
+                "Please work on this step. If done, say 'STEP COMPLETED'."
+            )
+        else:
+            return MessageAction(content="All steps completed.", source='agent')
 
-        # 把剩余任务注入上下文
-        wrapped_history = self._wrap_prompt(state.history)
+        # 构造新的 history：原 history + 新 prefix（作为 system 或 user）
+        extended_history = [
+            MessageAction(content=prefix_msg, source='user')
+        ] + state.history
 
-        # 让 CodeActAgent 干活
-        action = self.codeact.step(state.copy(update={"history": wrapped_history}))
+        # Step 3: 使用 CodeActAgent 执行（注意：这里仍存在 history 篡改风险）
+        action = self.codeact.step(state.copy(update={"history": extended_history}))
 
-        # 如果 CodeActAgent 认为做完了，就勾掉当前子任务
-        if isinstance(action, MessageAction) and action.source == "agent":
-            if self.todo:
-                return UpdateTodoAction(todo_list=self.todo.copy(), done_index=0)
-            else:
-                return action   # 真正结束
+        # Step 4: 如果 agent 完成当前 step，则更新 todo
+        if isinstance(action, MessageAction):
+            if 'STEP COMPLETED' in action.content.upper():
+                self.todo.pop(0)
+                logger.info(f"[TodoCodeAct] Step completed. {len(self.todo)} remain.")
+                # 返回新指令或结束
+                if self.todo:
+                    return MessageAction(
+                        content=f"继续：{self.todo[0]}",
+                        keep_details=True
+                    )
+                else:
+                    return MessageAction(content="Task completed.", source='agent')
+
         return action
-
-    # ---- 4. 观察 TODO 更新 ----
-    def on_observation(self, obs: Observation):
-        if isinstance(obs, MessageAction) and obs.metadata.get("remaining") is not None:
-            self.todo = obs.metadata["remaining"]
-            logger.info("[TodoCodeAct] 剩余 %d 项", len(self.todo))
