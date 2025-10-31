@@ -9,7 +9,6 @@ from openhands.core.config import LLMConfig
 from openhands.events.action import MessageAction
 from openhands.llm.llm import LLM
 from openhands.core.config import AgentConfig
-from openhands.core.metrics import Metrics
 from openhands.events.observation import Observation
 
 logger = logging.getLogger(__name__)
