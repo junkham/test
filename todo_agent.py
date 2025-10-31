@@ -27,7 +27,7 @@ class TodoCodeActAgent(Agent):
     def __init__(self, llm_config: LLMConfig, config=None):
         super().__init__(llm_config, config)
         self.llm = LLM(llm_config)
-        self.codeact = CodeActAgent(llm_config, config)   # 真正干活的
+        self.codeact = CodeActAgent(self.llm, config)   # 真正干活的
         self.todo: List[str] = []
 
     # ---- 1. 一次性生成 TODO ----
